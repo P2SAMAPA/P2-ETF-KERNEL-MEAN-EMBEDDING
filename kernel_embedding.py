@@ -1,53 +1,46 @@
 import numpy as np
+from scipy.spatial.distance import pdist, squareform
 
-def rbf_kernel(x, y, gamma=0.5):
-    """RBF kernel: exp(-gamma * ||x-y||^2)"""
-    diff = x - y
-    return np.exp(-gamma * np.dot(diff, diff))
+def rbf_kernel_median(X, Y):
+    """RBF kernel with bandwidth = median of pairwise distances in X (or between X and Y)."""
+    # Compute pairwise distances
+    XY = np.vstack([X, Y])
+    dists = pdist(XY)
+    median_dist = np.median(dists)
+    if median_dist == 0:
+        median_dist = 1.0
+    gamma = 1.0 / (2 * median_dist**2)
+    # Compute kernel matrix
+    K = np.exp(-gamma * cdist(X, Y, metric='sqeuclidean'))
+    return K, gamma
 
-def mmd(samples1, samples2, kernel_func, gamma=0.5):
+def mmd_unbiased(X, Y):
     """
-    Compute unbiased estimate of MMD^2.
+    Unbiased MMD^2 using quadratic time.
     """
-    n1 = len(samples1)
-    n2 = len(samples2)
-    # Use matrix operations for speed
-    # Compute pairwise distances and then kernel matrices
-    # For 1D samples, we can compute directly
-    K_xx = np.zeros((n1, n1))
-    for i in range(n1):
-        for j in range(n1):
-            K_xx[i,j] = kernel_func(samples1[i], samples1[j], gamma=gamma)
-    K_yy = np.zeros((n2, n2))
-    for i in range(n2):
-        for j in range(n2):
-            K_yy[i,j] = kernel_func(samples2[i], samples2[j], gamma=gamma)
-    K_xy = np.zeros((n1, n2))
-    for i in range(n1):
-        for j in range(n2):
-            K_xy[i,j] = kernel_func(samples1[i], samples2[j], gamma=gamma)
-    term1 = K_xx.mean()
-    term2 = K_yy.mean()
+    n = len(X)
+    m = len(Y)
+    # Compute kernel matrices using median heuristic
+    K_xx, gamma = rbf_kernel_median(X, X)
+    K_yy, _ = rbf_kernel_median(Y, Y)
+    K_xy, _ = rbf_kernel_median(X, Y)
+    # Unbiased estimator
+    term1 = (K_xx.sum() - np.trace(K_xx)) / (n * (n - 1))
+    term2 = (K_yy.sum() - np.trace(K_yy)) / (m * (m - 1))
     term3 = 2 * K_xy.mean()
     mmd2 = term1 + term2 - term3
-    # Numerical issues can cause negative values (should be >=0)
-    return max(mmd2, 0.0)
+    return max(0.0, mmd2)
 
-def compute_mmd_score(etf_returns, reference_returns, kernel='rbf', gamma=0.5):
+def compute_mmd_score(etf_returns, reference_returns):
     """
     Compute -MMD as score (higher = closer to reference).
     """
-    if len(etf_returns) == 0 or len(reference_returns) == 0:
-        return 0.0
-    # Use a subset if too large for performance
-    max_samples = 500
-    if len(etf_returns) > max_samples:
-        idx = np.random.choice(len(etf_returns), max_samples, replace=False)
-        etf_returns = etf_returns[idx]
-    if len(reference_returns) > max_samples:
-        idx = np.random.choice(len(reference_returns), max_samples, replace=False)
-        reference_returns = reference_returns[idx]
-    # Compute MMD
-    mmd_val = mmd(etf_returns, reference_returns, rbf_kernel, gamma=gamma)
-    # Return negative MMD (so higher score means closer)
+    # Ensure non‑degenerate reference
+    if np.std(reference_returns) < 1e-8:
+        # Add a tiny noise
+        reference_returns = reference_returns + np.random.normal(0, 1e-6, len(reference_returns))
+    X = etf_returns.reshape(-1, 1)
+    Y = reference_returns.reshape(-1, 1)
+    mmd_val = mmd_unbiased(X, Y)
+    # Return -MMD (so higher is better)
     return -mmd_val
