@@ -1,0 +1,132 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import json
+from datetime import datetime
+import config
+import data_manager
+from kernel_embedding import compute_mmd_score
+
+def convert_to_serializable(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [convert_to_serializable(i) for i in obj]
+    return obj
+
+def get_reference_distribution(returns_df, window, ref_type='benchmark', benchmark_ticker='SPY', low_vol_pct=20):
+    """
+    Returns the reference return series for the given window.
+    """
+    if ref_type == 'benchmark':
+        if benchmark_ticker not in returns_df.columns:
+            # Fallback to mean of all ETFs
+            ref_returns = returns_df.iloc[-window:].mean(axis=1).values
+        else:
+            ref_returns = returns_df[benchmark_ticker].iloc[-window:].values
+    else:  # low_vol regime
+        # Use the lowest volatility days within the window
+        vol = returns_df.iloc[-window:].std(axis=1)
+        # Select days with volatility below threshold (e.g., bottom 20%)
+        thresh = vol.quantile(low_vol_pct / 100.0)
+        low_vol_days = vol[vol < thresh].index
+        # Take returns of the benchmark ticker on those days (or mean of all ETFs)
+        if benchmark_ticker in returns_df.columns:
+            ref_returns = returns_df.loc[low_vol_days, benchmark_ticker].dropna().values
+        else:
+            ref_returns = returns_df.loc[low_vol_days].mean(axis=1).values
+    # Remove NaN
+    ref_returns = ref_returns[~np.isnan(ref_returns)]
+    if len(ref_returns) < 10:
+        # Fallback: use entire window
+        if benchmark_ticker in returns_df.columns:
+            ref_returns = returns_df[benchmark_ticker].iloc[-window:].dropna().values
+        else:
+            ref_returns = returns_df.iloc[-window:].mean(axis=1).values
+    return ref_returns
+
+def main():
+    if not config.HF_TOKEN:
+        print("HF_TOKEN not set")
+        return
+
+    df = data_manager.load_master_data()
+    all_results = {}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for universe_name, tickers in config.UNIVERSES.items():
+        print(f"\n=== Universe: {universe_name} (Kernel Mean Embedding) ===")
+        returns = data_manager.prepare_returns_matrix(df, tickers)
+        if returns.empty or len(returns) < max(config.WINDOWS) + 10:
+            print("  Insufficient data")
+            all_results[universe_name] = {"top_etfs": []}
+            continue
+
+        best_per_etf = {}
+        window_results = {}
+
+        for win in config.WINDOWS:
+            if len(returns) < win + 2:
+                print(f"  Skipping window {win}d (insufficient data)")
+                continue
+            print(f"  Processing window {win}d...")
+            ret_win = returns.iloc[-win:]
+            # Reference distribution for this window
+            ref_returns = get_reference_distribution(returns, win,
+                                                     ref_type=config.REFERENCE_TYPE,
+                                                     benchmark_ticker=config.BENCHMARK_TICKER,
+                                                     low_vol_pct=config.LOW_VOL_PERCENTILE)
+            etf_scores = {}
+            for etf in tickers:
+                if etf not in ret_win.columns:
+                    continue
+                x = ret_win[etf].dropna().values
+                if len(x) < 10:
+                    continue
+                score = compute_mmd_score(x, ref_returns, kernel=config.KERNEL, gamma=config.GAMMA)
+                etf_scores[etf] = score
+            window_results[win] = etf_scores
+            for etf, score in etf_scores.items():
+                if etf not in best_per_etf or score > best_per_etf[etf][0]:
+                    best_per_etf[etf] = (score, win)
+
+        if not best_per_etf:
+            print("  No valid predictions – falling back to historical mean return")
+            for etf in tickers:
+                if etf in returns.columns:
+                    mean_ret = returns[etf].iloc[-252:].mean()
+                    if not np.isnan(mean_ret):
+                        best_per_etf[etf] = (max(mean_ret, 1e-6), 0)
+            if not best_per_etf:
+                all_results[universe_name] = {"top_etfs": []}
+                continue
+
+        full_scores = {ticker: {"score": float(score), "best_window": win} for ticker, (score, win) in best_per_etf.items()}
+        sorted_etfs = sorted(best_per_etf.items(), key=lambda x: x[1][0], reverse=True)
+        top_etfs = [{"ticker": ticker, "mmd_score": float(score), "best_window": win} for ticker, (score, win) in sorted_etfs[:config.TOP_N]]
+
+        print(f"  Top 3 ETFs by MMD score (closest to reference): {[e['ticker'] for e in top_etfs]}")
+        all_results[universe_name] = {
+            "top_etfs": top_etfs,
+            "full_scores": full_scores,
+            "window_results": window_results,
+            "run_date": today
+        }
+
+    Path("results").mkdir(exist_ok=True)
+    local_path = Path(f"results/kernel_embedding_{today}.json")
+    with open(local_path, "w") as f:
+        json.dump(convert_to_serializable({"run_date": today, "universes": all_results}), f, indent=2)
+
+    import push_results
+    push_results.push_daily_result(local_path)
+    print("\n=== Kernel Mean Embedding Engine complete ===")
+
+if __name__ == "__main__":
+    main()
