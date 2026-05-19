@@ -2,18 +2,24 @@ import numpy as np
 from scipy.spatial.distance import pdist, cdist
 
 def rbf_kernel_median(X, Y):
+    # Combine X and Y to compute median distance
     XY = np.vstack([X, Y])
-    dists = pdist(XY)
-    median_dist = np.median(dists)
-    if median_dist == 0:
-        median_dist = 1.0
-    gamma = 1.0 / (2 * median_dist**2)
+    if len(XY) < 2:
+        gamma = 1.0
+    else:
+        dists = pdist(XY)
+        median_dist = np.median(dists)
+        if median_dist < 1e-8:
+            median_dist = 1.0
+        gamma = 1.0 / (2 * median_dist**2)
     K = np.exp(-gamma * cdist(X, Y, metric='sqeuclidean'))
     return K, gamma
 
 def mmd_unbiased(X, Y):
     n = len(X)
     m = len(Y)
+    if n < 2 or m < 2:
+        return 0.0
     K_xx, _ = rbf_kernel_median(X, X)
     K_yy, _ = rbf_kernel_median(Y, Y)
     K_xy, _ = rbf_kernel_median(X, Y)
@@ -24,6 +30,9 @@ def mmd_unbiased(X, Y):
     return max(0.0, mmd2)
 
 def compute_mmd_score(etf_returns, reference_returns):
+    # Ensure both series have some variation
+    if np.std(etf_returns) < 1e-8:
+        etf_returns = etf_returns + np.random.normal(0, 1e-6, len(etf_returns))
     if np.std(reference_returns) < 1e-8:
         reference_returns = reference_returns + np.random.normal(0, 1e-6, len(reference_returns))
     X = etf_returns.reshape(-1, 1)
